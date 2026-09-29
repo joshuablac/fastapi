@@ -1428,3 +1428,218 @@ def test_get_route_handler_blocks_second_caller_until_first_build_completes():
     thread.join(timeout=2)
     assert not thread.is_alive()
     assert effective_context._app is not None
+
+
+def test_get_route_handler_reuses_app_built_by_racing_caller():
+    """The double-checked lock must make a second caller *reuse* the app
+    another racer already built and installed while it was waiting, not
+    build (or call get_route_handler()) itself."""
+    builds = {"n": 0}
+
+    class TrackingRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            return super().get_route_handler()
+
+    router = APIRouter(route_class=TrackingRoute)
+
+    @router.get("/items")
+    def read_items():  # pragma: no cover
+        return {"ok": True}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    included_router = cast(_IncludedRouter, app.router.routes[-1])
+    effective_context = included_router.effective_candidates()[0]
+    assert isinstance(effective_context, _EffectiveRouteContext)
+
+    async def sentinel_app(scope, receive, send):
+        response = PlainTextResponse("sentinel", headers={"x-sentinel": "yes"})
+        await response(scope, receive, send)
+
+    client = TestClient(app)
+    # APIRoute.__init__ already did one unconditional get_route_handler()
+    # build (for self.app); only the delta from here on matters.
+    builds_before = builds["n"]
+    results: list[tuple[int, str | None]] = []
+
+    def make_request() -> None:
+        response = client.get("/api/items")
+        results.append((response.status_code, response.headers.get("x-sentinel")))
+
+    with effective_context._app_lock:
+        thread = threading.Thread(target=make_request)
+        thread.start()
+        thread.join(timeout=0.2)
+        assert thread.is_alive(), "second caller should block on the held lock"
+        # Simulate the lock holder finishing its own build and installing a
+        # (sentinel) app just before releasing the lock.
+        effective_context._app = sentinel_app
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert results == [(200, "yes")]
+    assert builds["n"] == builds_before
+
+
+# --- A4-F3: O(1) route-tree invalidation (_get_routes_version) ---
+#
+# _get_routes_version() used to recursively re-sum _routes_version over every router in
+# the included subtree on every call, which made even the first route's dispatch cost grow
+# with the total number of routes (every call is also several-per-request: once from
+# matches(), again from handle(), once per nesting level). It is replaced by a memoized
+# per-subtree sum: a process-wide generation counter, bumped by _mark_routes_changed(), is
+# used only to decide whether the *previous* walk's result is still exact -- an unchanged
+# generation anywhere in the process guarantees this router's own subtree did not change
+# either, since every mutation bumps that same counter. This keeps the *value*
+# _get_routes_version() returns identical to the old per-subtree sum (so it stays exact
+# per-router, not per-process), while making the steady-state (no ongoing mutations) cost
+# O(1). The tests below pin: the new mechanism still catches a mutation applied *after* a
+# request has already warmed the candidate cache; an unrelated router's mutation does
+# *not* spuriously invalidate this router's cache (unlike comparing against the raw global
+# counter directly, which was tried first and reverted -- see the "regression" test below,
+# which pins the concrete facet-A symptom that a naive global-counter comparison caused);
+# and the walk itself does not run on every request once the cache is warm.
+
+
+def test_nested_router_mutation_after_first_request_is_served():
+    """A route added to an already-included, already-requested nested router
+    must be served by a later request -- the candidate cache warmed by the
+    first request must not shadow the mutation."""
+    parent_router = APIRouter()
+    child_router = APIRouter()
+    parent_router.include_router(child_router, prefix="/child")
+
+    @child_router.get("/existing")
+    def read_existing():
+        return {"existing": True}
+
+    app = FastAPI()
+    app.include_router(parent_router, prefix="/api")
+    client = TestClient(app)
+
+    # Warm the candidate cache with a real request before any mutation.
+    assert client.get("/api/child/existing").json() == {"existing": True}
+    assert client.get("/api/child/new").status_code == 404
+
+    @child_router.get("/new")
+    def read_new():
+        return {"new": True}
+
+    response = client.get("/api/child/new")
+    assert response.status_code == 200
+    assert response.json() == {"new": True}
+
+
+def test_unrelated_router_mutation_does_not_invalidate_this_apps_cached_candidates():
+    """A completely unrelated, unconnected router's mutation bumps the
+    process-wide generation counter, but must NOT force this app's
+    _IncludedRouter to rebuild its candidate list: _get_routes_version()
+    memoizes the exact per-subtree sum and only re-walks to confirm it is
+    still correct, so an unrelated mutation costs (at most) one wasted walk,
+    never a spurious cache miss."""
+    router = APIRouter()
+
+    @router.get("/items")
+    def read_items():
+        return ["item"]  # pragma: no cover
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    included_router = cast(_IncludedRouter, app.router.routes[-1])
+
+    first_candidates = included_router.effective_candidates()
+    assert included_router.effective_candidates() is first_candidates
+
+    unrelated_router = APIRouter()
+    unrelated_router.add_api_route("/noop", lambda: "ok")  # pragma: no cover
+
+    second_candidates = included_router.effective_candidates()
+    assert second_candidates is first_candidates
+
+
+def test_unrelated_app_construction_does_not_reset_included_route_handler_state():
+    """Regression test for a bug introduced (and fixed within the same
+    commit, before landing) by an earlier version of the O(1)
+    _get_routes_version(): comparing routers directly against a raw,
+    process-wide generation counter made *any* unrelated FastAPI() app's
+    construction (itself a series of route registrations, e.g. for
+    /openapi.json) look like a route mutation to *every other* app in the
+    process, which reset every included route's cached
+    get_route_handler() closure -- reintroducing the exact facet-A bug
+    fixed by the "build the handler once" commit, this time triggered by
+    code that never touches the affected app at all."""
+    builds = {"n": 0}
+
+    class RateLimitedRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            original = super().get_route_handler()
+            state = {"hits": 0}
+
+            async def handler(request: Request):
+                state["hits"] += 1
+                if state["hits"] > 2:
+                    return PlainTextResponse("rate limited", status_code=429)
+                return await original(request)
+
+            return handler
+
+    router = APIRouter(route_class=RateLimitedRoute)
+
+    @router.get("/items")
+    def read_items():
+        return {"ok": True}
+
+    app_a = FastAPI()
+    app_a.include_router(router, prefix="/api")
+    client_a = TestClient(app_a)
+
+    assert client_a.get("/api/items").status_code == 200
+    assert client_a.get("/api/items").status_code == 200
+    builds_before_unrelated_app = builds["n"]
+
+    # Constructing an unrelated app must not touch app_a's cached state.
+    FastAPI()
+
+    response = client_a.get("/api/items")
+    assert response.status_code == 429
+    assert builds["n"] == builds_before_unrelated_app
+
+
+def test_get_routes_version_does_not_walk_on_every_request_once_warm():
+    """Once a router's version has been computed once (and nothing has
+    mutated any router in the process since), _get_routes_version() must
+    return the memoized value in O(1) -- it must not re-walk the subtree on
+    every call."""
+    router = APIRouter()
+    for index in range(20):
+
+        @router.get(f"/items/{index}")
+        def read_item(index: int = index):  # pragma: no cover
+            return {"index": index}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+
+    # Warm up: the first call after construction (and after every route
+    # registered above, each of which bumped the generation) pays for one
+    # walk.
+    assert client.get("/api/items/0").status_code == 200
+
+    walk_calls = {"n": 0}
+    original_walk = APIRouter._walk_routes_version
+
+    def counting_walk(self, seen=None):
+        walk_calls["n"] += 1
+        return original_walk(self, seen)
+
+    APIRouter._walk_routes_version = counting_walk
+    try:
+        for _ in range(10):
+            assert client.get("/api/items/0").status_code == 200
+    finally:
+        APIRouter._walk_routes_version = original_walk
+
+    assert walk_calls["n"] == 0

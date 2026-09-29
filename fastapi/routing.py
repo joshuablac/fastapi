@@ -847,6 +847,27 @@ _effective_route_context_var: ContextVar[Any | None] = ContextVar(
 )
 _SCOPE_MISSING = object()
 
+# Process-wide monotonic counter used to invalidate the included-router
+# candidate caches (_IncludedRouter.effective_candidates() /
+# effective_low_priority_routes(), see APIRouter._get_routes_version() below)
+# in O(1), instead of recursively re-walking every route in the included
+# subtree on every request. Bumping it on *any* route mutation anywhere is a
+# superset of the old per-subtree-sum invalidation (strictly more
+# invalidating, never less), so it cannot miss an invalidation the old
+# scheme used to catch. The trade-off: mutating routes in one app can also
+# force an unrelated app's already-built candidate list to be recomputed on
+# its next access (still correct -- no stale routes are ever served -- just
+# an occasional extra, harmless rebuild).
+_routes_generation_lock = threading.Lock()
+_routes_generation = 0
+
+
+def _bump_routes_generation() -> int:
+    global _routes_generation
+    with _routes_generation_lock:
+        _routes_generation += 1
+        return _routes_generation
+
 
 def _frontend_dependency_endpoint() -> None:
     pass  # pragma: no cover
@@ -2586,13 +2607,41 @@ class APIRouter(routing.Router):
         self.generate_unique_id_function = generate_unique_id_function
         self.strict_content_type = strict_content_type
         self._routes_version = 0
+        self._routes_version_memo: tuple[int, int] | None = None
         self._low_priority_routes: list[BaseRoute] = []
         self._frontend_routes: _FrontendRouteGroup | None = None
 
     def _mark_routes_changed(self) -> None:
+        # Order matters: bump the local counter *before* the global one, so
+        # that a concurrent _get_routes_version() can never observe the new
+        # global generation together with the stale local _routes_version
+        # (which would memoize a stale sum under a fresh generation).
         self._routes_version += 1
+        _bump_routes_generation()
 
-    def _get_routes_version(self, seen: set[int] | None = None) -> int:
+    def _get_routes_version(self) -> int:
+        # Fast path: nothing has mutated *anywhere in the process* since the
+        # last time this router's version was computed, so the memoized
+        # per-subtree sum is still exact -- every _mark_routes_changed()
+        # call anywhere bumps the same _routes_generation counter, so an
+        # unchanged generation guarantees an unchanged sum. This makes the
+        # steady-state (no ongoing route mutations) cost O(1) instead of a
+        # full subtree walk on every call, while returning the *same value*
+        # the old per-subtree walk would -- unlike comparing routers
+        # directly against the raw global counter, an unrelated app's route
+        # mutation cannot make this router's version appear to change, so it
+        # cannot spuriously invalidate _IncludedRouter's cached effective
+        # contexts (and the ASGI-app/closure state cached on them, see
+        # APIRoute.handle) for a subtree that did not actually change.
+        generation = _routes_generation
+        memo = self._routes_version_memo
+        if memo is not None and memo[0] == generation:
+            return memo[1]
+        version = self._walk_routes_version()
+        self._routes_version_memo = (generation, version)
+        return version
+
+    def _walk_routes_version(self, seen: set[int] | None = None) -> int:
         if seen is None:
             seen = set()
         router_id = id(self)
@@ -2602,7 +2651,7 @@ class APIRouter(routing.Router):
         version = self._routes_version
         for route in self.routes:
             if isinstance(route, _IncludedRouter):
-                version += route.original_router._get_routes_version(seen)
+                version += route.original_router._walk_routes_version(seen)
         return version
 
     def _contains_router(
