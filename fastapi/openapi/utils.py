@@ -141,11 +141,16 @@ def _get_openapi_security_definitions(
             security_scheme.model,
             by_alias=True,
             exclude_none=True,
-            # This is OpenAPI document generation, not a response body: a
-            # security scheme property/example that happens to start with
-            # "_sa" must still be published, unlike jsonable_encoder's
-            # sqlalchemy_safe=True default (a hack for SQLAlchemy response
-            # objects, unrelated to OpenAPI schemas).
+            # Safe to disable here: security_scheme.model is always an
+            # already-dumped Pydantic model (SecurityBase.model), never a
+            # caller-supplied object, so a "_sa"-prefixed OAuth2 scope name
+            # must still be published rather than silently dropped. The
+            # sqlalchemy_safe=True default is not actually "unrelated to
+            # OpenAPI" in general, though: an example value elsewhere in
+            # this module (see _get_openapi_operation_parameters and
+            # get_openapi_operation_request_body below) can be an arbitrary
+            # object the caller passed in, including a live SQLAlchemy
+            # instance, so those call sites keep the default.
             sqlalchemy_safe=False,
         )
         security_name = security_scheme.scheme_name
@@ -225,13 +230,15 @@ def _get_openapi_operation_parameters(
             openapi_examples = getattr(field_info, "openapi_examples", None)
             example = getattr(field_info, "example", None)
             if openapi_examples:
-                # OpenAPI doc generation: don't drop "_sa"-prefixed example
-                # keys (see the comment on the jsonable_encoder call above).
-                parameter["examples"] = jsonable_encoder(
-                    openapi_examples, sqlalchemy_safe=False
-                )
+                # Deliberately still the sqlalchemy_safe=True default here:
+                # unlike the security-scheme dump and the full document
+                # encode below, an example value can be an arbitrary object
+                # supplied by the caller, including a live SQLAlchemy
+                # instance -- see the module-level note above
+                # _get_openapi_security_definitions.
+                parameter["examples"] = jsonable_encoder(openapi_examples)
             elif example is not _Unset:
-                parameter["example"] = jsonable_encoder(example, sqlalchemy_safe=False)
+                parameter["example"] = jsonable_encoder(example)
             if getattr(field_info, "deprecated", None):
                 parameter["deprecated"] = True
             parameters.append(parameter)
@@ -264,14 +271,13 @@ def get_openapi_operation_request_body(
         request_body_oai["required"] = required
     request_media_content: dict[str, Any] = {"schema": body_schema}
     if field_info.openapi_examples:
-        # OpenAPI doc generation: don't drop "_sa"-prefixed example keys.
+        # sqlalchemy_safe=True default, same reasoning as the parameter
+        # examples above: this value is caller-supplied and arbitrary.
         request_media_content["examples"] = jsonable_encoder(
-            field_info.openapi_examples, sqlalchemy_safe=False
+            field_info.openapi_examples
         )
     elif field_info.example is not _Unset:
-        request_media_content["example"] = jsonable_encoder(
-            field_info.example, sqlalchemy_safe=False
-        )
+        request_media_content["example"] = jsonable_encoder(field_info.example)
     request_body_oai["content"] = {request_media_type: request_media_content}
     return request_body_oai
 
@@ -689,10 +695,17 @@ def get_openapi(
         output["tags"] = tags
     if external_docs:
         output["externalDocs"] = external_docs
-    # OpenAPI doc generation: don't let a model property or schema-map key
-    # (e.g. an alias, or an "openapi_examples" name) starting with "_sa"
-    # silently vanish -- that leaves it in "required" with no matching
-    # schema, an internally inconsistent document.
+    # Safe to disable here: `output` is already a plain, fully-assembled
+    # dict of already-encoded data (the pieces built above, wrapped in the
+    # OpenAPI model and dumped), never a caller-supplied object, so a model
+    # property whose alias starts with "_sa" must still be published
+    # instead of silently vanishing from "properties" while staying in
+    # "required" -- an internally inconsistent document. This does not
+    # recover an "_sa"-prefixed openapi_examples/example name or value:
+    # those are still dropped earlier, by the sqlalchemy_safe=True default
+    # kept in _get_openapi_operation_parameters and
+    # get_openapi_operation_request_body above, because that data can be
+    # an arbitrary object the caller supplied.
     return jsonable_encoder(  # type: ignore[no-any-return]
         OpenAPI(**output),
         by_alias=True,
