@@ -373,6 +373,25 @@ def _build_response_args(
     return response_args
 
 
+def _push_generator_close(
+    async_exit_stack: AsyncExitStack, gen: Any, *, is_async: bool
+) -> None:
+    # `gen` is whatever the endpoint function returned when called; nothing
+    # guarantees it actually is a generator (e.g. `is_sse_stream` doesn't
+    # require the endpoint to be a generator, and a `functools.wraps`
+    # decorator can make it look like an async/sync generator callable
+    # while returning a plain iterator that has no `close`/`aclose`). Only
+    # push the callback when the method is actually there.
+    if is_async:
+        aclose = getattr(gen, "aclose", None)
+        if aclose is not None:
+            async_exit_stack.push_async_callback(aclose)
+    else:
+        close = getattr(gen, "close", None)
+        if close is not None:
+            async_exit_stack.push_async_callback(run_in_threadpool, close)
+
+
 def get_request_handler(
     dependant: Dependant,
     body_field: ModelField | None = None,
@@ -531,11 +550,15 @@ def get_request_handler(
                 # before `_sse_producer_cm` is entered below, so on unwind
                 # (LIFO) the producer task group is cancelled and joined
                 # first, guaranteeing `gen` is no longer under active
-                # iteration when we close it.
-                if _is_async_gen_callable(dependant.call):
-                    async_exit_stack.push_async_callback(gen.aclose)
-                else:
-                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
+                # iteration when we close it. `is_sse_stream` doesn't
+                # require the endpoint to be a generator (e.g. a plain
+                # function returning a list also works here), so this is a
+                # no-op unless `gen` actually has the method.
+                _push_generator_close(
+                    async_exit_stack,
+                    gen,
+                    is_async=_is_async_gen_callable(dependant.call),
+                )
 
                 def _serialize_sse_item(item: Any) -> bytes:
                     if isinstance(item, ServerSentEvent):
@@ -707,10 +730,11 @@ def get_request_handler(
                 # See the matching comment in the SSE branch above: close
                 # the generator on the request-scoped exit stack so its
                 # cleanup runs before dependency-with-yield teardown.
-                if _is_async_gen_callable(dependant.call):
-                    async_exit_stack.push_async_callback(gen.aclose)
-                else:
-                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
+                _push_generator_close(
+                    async_exit_stack,
+                    gen,
+                    is_async=_is_async_gen_callable(dependant.call),
+                )
 
                 def _serialize_item(item: Any) -> bytes:
                     return _serialize_data(item) + b"\n"
@@ -754,8 +778,9 @@ def get_request_handler(
                 # cleanup runs before dependency-with-yield teardown. Do
                 # this before `gen` is reassigned to the checkpoint-wrapping
                 # generator below, so we close the user's own generator.
-                if _is_async_gen_callable(dependant.call):
-                    async_exit_stack.push_async_callback(gen.aclose)
+                is_async_gen = _is_async_gen_callable(dependant.call)
+                _push_generator_close(async_exit_stack, gen, is_async=is_async_gen)
+                if is_async_gen:
 
                     async def _async_stream_raw(
                         async_gen: AsyncIterator[Any],
@@ -767,8 +792,6 @@ def get_request_handler(
                             await anyio.sleep(0)
 
                     gen = _async_stream_raw(gen)
-                else:
-                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
                 )
