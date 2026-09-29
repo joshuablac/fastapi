@@ -194,7 +194,7 @@ def test_body_openapi_examples_starting_with_sa_are_still_dropped():
     # starting with "_sa" is still silently dropped. The four call sites
     # that build parameter/body examples keep the sqlalchemy_safe=True
     # default, because their input can be an arbitrary caller-supplied
-    # object (see test_sqlalchemy_object_as_example_matches_master below),
+    # object (see test_sqlalchemy_object_as_example_is_encoded_safely below),
     # and that default filters dict keys by prefix regardless of whether
     # the dict is an example map or a decoded SQLAlchemy object.
     schema = client.get("/openapi.json").json()
@@ -239,8 +239,8 @@ def test_legacy_single_example_params_still_generate_openapi():
     assert body["content"]["application/json"]["example"] == {"value": 2.0}
 
 
-def test_sqlalchemy_object_as_example_matches_master():
-    # Regression test for the defect this branch was rejected for: with
+def test_sqlalchemy_object_as_example_is_encoded_safely():
+    # Example values are caller-supplied and may be ORM objects. With
     # sqlalchemy_safe=False at the four example call sites, a transient
     # SQLAlchemy instance published "_sa_instance_state" into the OpenAPI
     # document, and a session-attached instance made app.openapi() raise

@@ -230,12 +230,8 @@ def _get_openapi_operation_parameters(
             openapi_examples = getattr(field_info, "openapi_examples", None)
             example = getattr(field_info, "example", None)
             if openapi_examples:
-                # Deliberately still the sqlalchemy_safe=True default here:
-                # unlike the security-scheme dump and the full document
-                # encode below, an example value can be an arbitrary object
-                # supplied by the caller, including a live SQLAlchemy
-                # instance -- see the module-level note above
-                # _get_openapi_security_definitions.
+                # Keep the sqlalchemy_safe=True default: example values are
+                # caller-supplied and may be SQLAlchemy instances.
                 parameter["examples"] = jsonable_encoder(openapi_examples)
             elif example is not _Unset:
                 parameter["example"] = jsonable_encoder(example)
