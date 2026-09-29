@@ -19,6 +19,7 @@ Two bugs are covered:
   is cancelled. https://github.com/fastapi/fastapi/discussions/15725
 """
 
+import functools
 from collections.abc import AsyncIterable, Iterable
 from typing import Annotated, Any
 
@@ -26,6 +27,7 @@ import anyio
 import pytest
 from fastapi import Depends, FastAPI
 from fastapi.responses import EventSourceResponse, StreamingResponse
+from fastapi.testclient import TestClient
 from starlette.types import Message, Scope
 
 pytestmark = [
@@ -64,11 +66,11 @@ def _cleanup(session: Session) -> None:
 
 
 async def _cleanup_checkpoint(session: Session) -> None:
-    # The required behavior (task brief): a generator `finally` that itself
-    # *awaits a checkpoint* must complete - including everything after that
-    # await - before the dependency's teardown. Checking `session.closed`
-    # only *after* the await (not before) is what proves the await itself
-    # was not cut short by a cancelled scope.
+    # A generator `finally` that itself *awaits a checkpoint* must complete
+    # - including everything after that await - before the dependency's
+    # teardown. Checking `session.closed` only *after* the await (not
+    # before) is what proves the await itself was not cut short by a
+    # cancelled scope.
     await anyio.sleep(0)
     events.append(
         "gen cleanup post-checkpoint after dep exit"
@@ -146,6 +148,26 @@ def stream_sse_sync(session: SessionDep) -> Iterable[int]:
         _cleanup(session)
 
 
+@app.get("/sse-slow-producer", response_class=EventSourceResponse)
+async def sse_slow_producer(session: SessionDep) -> AsyncIterable[int]:
+    # Unlike `/sse` above, this generator is parked *inside its own
+    # `await`* (not at a bare `yield`) at the moment the disconnect lands,
+    # for as long as `_producer` is genuinely driving it - i.e. `gen`'s
+    # frame is entered on `_producer`'s task, not idle. Closing `gen`
+    # before the producer task group has been cancelled+joined would then
+    # race a live task still inside `gen`, which is exactly what
+    # guarantees "no longer under active iteration" is meant to prevent.
+    try:
+        i = 0
+        while True:
+            yield i
+            i += 1
+            if i >= 3:
+                await anyio.sleep(10)
+    finally:
+        _cleanup(session)
+
+
 # The endpoints below have *no* internal checkpoint in their loop (unlike
 # the ones above), so they are always parked at their own bare `yield` with
 # nothing in flight when a disconnect happens - the case this fix targets.
@@ -202,6 +224,79 @@ async def jsonl_finally_raises(session: SessionDep) -> AsyncIterable[int]:
     finally:
         _cleanup(session)
         raise RuntimeError("cleanup itself failed")
+
+
+# Regression endpoints: `dependant.call(...)` is not guaranteed to return an
+# actual generator. `is_sse_stream` is based on the response class, not on
+# the endpoint being a generator, and a `functools.wraps` decorator can make
+# `_is_async_gen_callable`/`_is_gen_callable` true (they use
+# `inspect.unwrap`) while the object actually returned has no
+# `close`/`aclose`. Closing the generator must not assume the method exists.
+@app.get("/list-sse", response_class=EventSourceResponse)
+def list_sse() -> list[int]:
+    return [1, 2, 3]
+
+
+class _SyncIterator:
+    """A plain iterator - has `__iter__`/`__next__`, but no `close`."""
+
+    def __init__(self, source: Iterable[int]) -> None:
+        self._it = iter(source)
+
+    def __iter__(self) -> "_SyncIterator":
+        return self
+
+    def __next__(self) -> int:
+        return next(self._it)
+
+
+class _AsyncIterator:
+    """A plain async iterator - has `__aiter__`/`__anext__`, but no `aclose`."""
+
+    def __init__(self, source: AsyncIterable[str]) -> None:
+        self._ait = source.__aiter__()
+
+    def __aiter__(self) -> "_AsyncIterator":
+        return self
+
+    async def __anext__(self) -> str:
+        return await self._ait.__anext__()
+
+
+def _wraps_sync_generator_as_plain_iterator(
+    f: Any,
+) -> Any:
+    @functools.wraps(f)
+    def wrapper(*args: Any, **kwargs: Any) -> _SyncIterator:
+        return _SyncIterator(f(*args, **kwargs))
+
+    return wrapper
+
+
+def _wraps_async_generator_as_plain_iterator(
+    f: Any,
+) -> Any:
+    @functools.wraps(f)
+    def wrapper(*args: Any, **kwargs: Any) -> _AsyncIterator:
+        return _AsyncIterator(f(*args, **kwargs))
+
+    return wrapper
+
+
+@app.get("/jsonl-decorated-plain-iterator")
+@_wraps_sync_generator_as_plain_iterator
+def jsonl_decorated_plain_iterator() -> Iterable[int]:
+    yield from range(3)
+
+
+@app.get("/raw-decorated-plain-iterator", response_class=StreamingResponse)
+@_wraps_async_generator_as_plain_iterator
+async def raw_decorated_plain_iterator() -> AsyncIterable[str]:
+    for i in range(3):
+        yield f"{i}"
+
+
+client = TestClient(app)
 
 
 async def _call_with_http_disconnect(
@@ -341,12 +436,12 @@ async def test_sse_disconnect_returns_cleanly(backpressure: bool) -> None:
 async def test_generator_finally_checkpoint_completes_before_dependency_exit_http_disconnect(
     path: str,
 ) -> None:
-    # The literal required behavior: a generator `finally` that itself
-    # awaits a checkpoint (not just starts) must complete *before* the
-    # dependency's teardown - i.e. the close must not be cancelled/cut off
-    # partway through. `session.closed` is only checked *after* the await
-    # inside `_cleanup_checkpoint`, so "gen cleanup post-checkpoint"
-    # (without "after dep exit") proves the await itself ran to completion
+    # A generator `finally` that itself awaits a checkpoint (not just
+    # starts) must complete *before* the dependency's teardown - i.e. the
+    # close must not be cancelled/cut off partway through. `session.closed`
+    # is only checked *after* the await inside `_cleanup_checkpoint`, so
+    # "gen cleanup post-checkpoint" (without "after dep exit") proves the
+    # await itself ran to completion
     # first.
     events.clear()
     await _call_with_http_disconnect(path)
@@ -369,15 +464,16 @@ async def test_sse_generator_finally_checkpoint_completes_before_dependency_exit
 ):
     # SSE specifically: the producer task group's `_producer` drives the
     # user generator directly (`sse_aiter` *is* `gen` for async
-    # generators), so there's a theoretical race between
-    # `tg.cancel_scope.cancel()` landing while `_producer` is genuinely
-    # inside `gen.__anext__()` (in which case cancellation reaches the
-    # generator directly, ahead of and independently of our `aclose()`
-    # callback) versus `gen` being parked at its own bare `yield` (the
-    # case this fix targets, where only our `aclose()` call ever resumes
-    # it). This endpoint has no internal checkpoint in its loop, so it is
-    # always in the latter state when idle. Either way the checkpoint
-    # inside `finally` must complete before the dependency's exit.
+    # generators). This endpoint has no internal checkpoint in its loop, so
+    # `gen` is idle at its own bare `yield` (not inside one of its own
+    # `await`s) when the disconnect lands - only our `aclose()` call ever
+    # resumes it - and the checkpoint inside `finally` must complete before
+    # the dependency's exit. (A generator parked in its own `await` instead
+    # is a different case, covered by
+    # `test_sse_generator_closed_only_after_producer_group_is_joined`
+    # below, where cancellation reaches it directly and its `finally`'s own
+    # checkpoint is itself cancelled - also correct, just not what this
+    # test exercises.)
     events.clear()
     await _call_with_http_disconnect("/sse-checkpoint-finally")
     assert events == ["gen cleanup post-checkpoint", "dep exit"]
@@ -393,4 +489,46 @@ async def test_generator_finally_exception_propagates_and_dependency_still_exits
     # The generator's own cleanup work still happened (before it raised),
     # and the dependency's exit still ran afterward - one misbehaving
     # generator does not stop the rest of the exit stack from unwinding.
+    assert events == ["gen cleanup", "dep exit"]
+
+
+def test_sse_response_class_without_a_generator_endpoint() -> None:
+    # `is_sse_stream` is based on `response_class`, not on the endpoint
+    # being a generator - a plain function returning a list must still
+    # work, not crash while trying to close something that was never a
+    # generator.
+    response = client.get("/list-sse")
+    assert response.status_code == 200
+    assert response.text == "data: 1\n\ndata: 2\n\ndata: 3\n\n"
+
+
+def test_jsonl_decorated_endpoint_returning_a_plain_iterator() -> None:
+    # `_is_gen_callable` sees through `functools.wraps` (`inspect.unwrap`),
+    # so a decorator can make FastAPI believe the endpoint is a generator
+    # callable while the object actually returned has no `close`.
+    response = client.get("/jsonl-decorated-plain-iterator")
+    assert response.status_code == 200
+    assert response.text == "0\n1\n2\n"
+
+
+def test_raw_decorated_endpoint_returning_a_plain_async_iterator() -> None:
+    response = client.get("/raw-decorated-plain-iterator")
+    assert response.status_code == 200
+    assert response.text == "012"
+
+
+async def test_sse_generator_closed_only_after_producer_group_is_joined() -> None:
+    # Every other SSE test disconnects while `gen` is idle at its own bare
+    # `yield`, so it can't tell the difference between "close `gen` before
+    # the producer task group is cancelled" and "close it after" - `gen`
+    # isn't under active iteration either way. Here `gen` is genuinely
+    # parked inside its own `await anyio.sleep(10)`, entered on the
+    # producer's task, when the disconnect lands. If `gen.aclose()` were
+    # pushed *after* `_sse_producer_cm` (closing before the group is
+    # cancelled+joined instead of after), this races a still-running task
+    # against `gen` and fails - by hanging (mutant S2) or by an escaped
+    # `ExceptionGroup` (this ordering mutant).
+    events.clear()
+    caught = await _call_with_http_disconnect("/sse-slow-producer", after=3)
+    assert caught is None, f"disconnect raised: {caught!r}"
     assert events == ["gen cleanup", "dep exit"]
