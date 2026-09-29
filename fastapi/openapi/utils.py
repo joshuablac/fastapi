@@ -385,14 +385,20 @@ def get_openapi_path(
                     operation["requestBody"] = request_body_oai
             if route.callbacks:
                 callbacks = {}
-                for callback in route.callbacks:
-                    if isinstance(callback, routing.APIRoute):
+                # route.callbacks can itself contain _IncludedRouter nodes when the
+                # callback router was composed with include_router(), same as
+                # route.routes for a normal router. Traverse it the same way
+                # get_fields_from_routes does, instead of assuming a flat list of
+                # APIRoute objects.
+                for callback_context in routing.iter_route_contexts(route.callbacks):
+                    callback = _get_api_route_for_openapi(callback_context)
+                    if callback is not None:
                         (
                             cb_path,
                             cb_security_schemes,
                             cb_definitions,
                         ) = get_openapi_path(
-                            route=cast(routing._APIRouteLike, callback),
+                            route=callback,
                             operation_ids=operation_ids,
                             model_name_map=model_name_map,
                             field_mapping=field_mapping,
