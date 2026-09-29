@@ -1099,6 +1099,20 @@ def _populate_api_route_state(
                 response_model = None
             else:
                 response_model = return_annotation
+    elif (route.is_sse_stream or route.is_json_stream) and response_model:
+        # An explicit response_model= on a generator endpoint was previously
+        # ignored: it became route.response_model / response_field, which the
+        # streaming code paths never read, so items went out via
+        # jsonable_encoder unfiltered. Route it through stream_item_type
+        # instead, same as the return-annotation form above, so per-item
+        # validation, response_model_include/exclude/..., and the OpenAPI
+        # itemSchema/contentSchema all apply. ServerSentEvent is excluded for
+        # the same reason as above: it's a transport wrapper, not a data
+        # model.
+        stream_item = get_stream_item_type(response_model) or response_model
+        if not lenient_issubclass(stream_item, ServerSentEvent):
+            route.stream_item_type = stream_item
+        response_model = None
     route.response_model = response_model
     if route.response_model:
         assert is_body_allowed_for_status_code(status_code), (
