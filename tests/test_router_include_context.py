@@ -1076,7 +1076,7 @@ async def test_apirouter_handle_fallback_without_include_context():
     assert messages[1]["body"] == b"items"
 
 
-# --- A1-F1 facet A: get_route_handler() built once per effective route context ---
+# --- get_route_handler() built once per effective route context ---
 #
 # Before the fix, APIRoute.handle() called request_response(self.get_route_handler())
 # on every request for a route reached through include_router(). A route_class
@@ -1482,7 +1482,7 @@ def test_get_route_handler_reuses_app_built_by_racing_caller():
     assert builds["n"] == builds_before
 
 
-# --- A4-F3: O(1) route-tree invalidation (_get_routes_version) ---
+# --- O(1) route-tree invalidation (_get_routes_version) ---
 #
 # _get_routes_version() used to recursively re-sum _routes_version over every router in
 # the included subtree on every call, which made even the first route's dispatch cost grow
