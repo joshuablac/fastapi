@@ -616,11 +616,39 @@ def get_request_handler(
                             except anyio.EndOfStream:
                                 pass
 
-                    async with anyio.create_task_group() as tg:
-                        tg.start_soon(_producer)
-                        tg.start_soon(_keepalive_inserter)
-                        yield receive_keepalive
-                        tg.cancel_scope.cancel()
+                    try:
+                        async with anyio.create_task_group() as tg:
+                            tg.start_soon(_producer)
+                            tg.start_soon(_keepalive_inserter)
+                            try:
+                                yield receive_keepalive
+                            finally:
+                                # Cancel (and, via the `async with` above,
+                                # join) the producer/keepalive tasks
+                                # *before* closing `receive_keepalive`
+                                # below. Closing it first (the previous
+                                # order, as a separate callback pushed
+                                # after this context manager on the exit
+                                # stack) can wake `_keepalive_inserter`
+                                # from `send_keepalive.send()` with
+                                # `BrokenResourceError` instead of
+                                # cancelling it, which this task group then
+                                # re-raises as
+                                # `ExceptionGroup([BrokenResourceError])`
+                                # on an ordinary disconnect.
+                                # Ref: https://github.com/fastapi/fastapi/discussions/15725
+                                tg.cancel_scope.cancel()
+                    finally:
+                        # Always close the stream handed to the consumer,
+                        # once the producer/keepalive tasks have fully
+                        # stopped running - including when an exception
+                        # (e.g. from a caller whose own `send()` raised on
+                        # disconnect) propagates through the task group
+                        # above instead of `yield receive_keepalive`
+                        # returning normally. Otherwise this outer
+                        # `finally` would be skipped and the stream would
+                        # only be closed later, by GC (ResourceWarning).
+                        await receive_keepalive.aclose()
 
                 # Enter the SSE context manager on the request-scoped
                 # exit stack. The stack outlives the streaming response,
@@ -629,9 +657,6 @@ def get_request_handler(
                 sse_receive_stream = await async_exit_stack.enter_async_context(
                     _sse_producer_cm()
                 )
-                # Ensure the receive stream is closed when the exit stack
-                # unwinds, preventing ResourceWarning from __del__.
-                async_exit_stack.push_async_callback(sse_receive_stream.aclose)
 
                 async def _sse_with_checkpoints(
                     stream: ObjectReceiveStream[bytes],
