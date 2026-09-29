@@ -526,8 +526,9 @@ async def test_sse_generator_closed_only_after_producer_group_is_joined() -> Non
     # producer's task, when the disconnect lands. If `gen.aclose()` were
     # pushed *after* `_sse_producer_cm` (closing before the group is
     # cancelled+joined instead of after), this races a still-running task
-    # against `gen` and fails - by hanging (mutant S2) or by an escaped
-    # `ExceptionGroup` (this ordering mutant).
+    # against `gen` and fails - by hanging (if the producer group is never
+    # cancelled) or by an escaped `ExceptionGroup` (if the generator is
+    # closed before the group is joined).
     events.clear()
     caught = await _call_with_http_disconnect("/sse-slow-producer", after=3)
     assert caught is None, f"disconnect raised: {caught!r}"
