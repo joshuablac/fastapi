@@ -747,6 +747,22 @@ def get_request_handler(
                         response = actual_response_class(content, **response_args)
                     if not is_body_allowed_for_status_code(response.status_code):
                         response.body = b""
+                        # A 205 response must not have content (RFC 9110
+                        # §15.3.6), but Starlette already computed
+                        # Content-Length from the body above. Correct it to
+                        # match the now-empty body instead of leaving it
+                        # stale, or omitting it, which would make an
+                        # HTTP/1.1 keep-alive connection frame as
+                        # read-until-close (RFC 9112 §6.3) and hang.
+                        # Scoped to 205 only: Starlette never sets
+                        # Content-Length for 204 or 304, and a 304's
+                        # Content-Length has a different, non-zero meaning
+                        # (RFC 9110 §15.4.5) that this must not touch.
+                        if (
+                            response.status_code == 205
+                            and "content-length" in response.headers
+                        ):
+                            response.headers["content-length"] = "0"
                     response.headers.raw.extend(solved_result.response.headers.raw)
         if errors:
             validation_error = RequestValidationError(
