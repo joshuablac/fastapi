@@ -30,7 +30,6 @@ from starlette.types import Message, Scope
 
 pytestmark = [
     pytest.mark.anyio,
-    pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning"),
 ]
 
 
@@ -62,6 +61,20 @@ app = FastAPI()
 
 def _cleanup(session: Session) -> None:
     events.append("gen cleanup after dep exit" if session.closed else "gen cleanup")
+
+
+async def _cleanup_checkpoint(session: Session) -> None:
+    # The required behavior (task brief): a generator `finally` that itself
+    # *awaits a checkpoint* must complete - including everything after that
+    # await - before the dependency's teardown. Checking `session.closed`
+    # only *after* the await (not before) is what proves the await itself
+    # was not cut short by a cancelled scope.
+    await anyio.sleep(0)
+    events.append(
+        "gen cleanup post-checkpoint after dep exit"
+        if session.closed
+        else "gen cleanup post-checkpoint"
+    )
 
 
 @app.get("/jsonl")
@@ -133,6 +146,64 @@ def stream_sse_sync(session: SessionDep) -> Iterable[int]:
         _cleanup(session)
 
 
+# The endpoints below have *no* internal checkpoint in their loop (unlike
+# the ones above), so they are always parked at their own bare `yield` with
+# nothing in flight when a disconnect happens - the case this fix targets.
+# Their `finally` instead awaits a checkpoint itself
+# (`_cleanup_checkpoint`), which is the specific required behavior: the
+# checkpoint *inside* the `finally`, not just the `finally` starting, must
+# complete before the dependency's teardown.
+@app.get("/jsonl-checkpoint-finally")
+async def jsonl_checkpoint_finally(session: SessionDep) -> AsyncIterable[int]:
+    try:
+        i = 0
+        while True:
+            yield i
+            i += 1
+    finally:
+        await _cleanup_checkpoint(session)
+
+
+@app.get("/raw-checkpoint-finally", response_class=StreamingResponse)
+async def raw_checkpoint_finally(session: SessionDep) -> AsyncIterable[str]:
+    try:
+        i = 0
+        while True:
+            yield f"{i}\n"
+            i += 1
+    finally:
+        await _cleanup_checkpoint(session)
+
+
+@app.get("/sse-checkpoint-finally", response_class=EventSourceResponse)
+async def sse_checkpoint_finally(session: SessionDep) -> AsyncIterable[int]:
+    try:
+        i = 0
+        while True:
+            yield i
+            i += 1
+    finally:
+        await _cleanup_checkpoint(session)
+
+
+@app.get("/jsonl-finally-raises")
+async def jsonl_finally_raises(session: SessionDep) -> AsyncIterable[int]:
+    # A generator whose own `finally` raises: previously this error was
+    # only ever observable as an unraisable/unretrieved-task warning at GC
+    # time, detached from the request. With the generator closed via the
+    # request's own exit stack, it now surfaces as a real exception from
+    # that unwind, visible to (and here, caught by) the caller.
+    try:
+        i = 0
+        while True:
+            yield i
+            i += 1
+            await anyio.sleep(0)
+    finally:
+        _cleanup(session)
+        raise RuntimeError("cleanup itself failed")
+
+
 async def _call_with_http_disconnect(
     path: str, *, after: int = 3, backpressure: bool = False
 ) -> Exception | None:
@@ -184,9 +255,17 @@ async def _call_with_send_raising(path: str, *, after: int = 3) -> Exception | N
     of ever delivering an `http.disconnect` message."""
     sent = 0
 
-    async def receive() -> Message:
-        await anyio.sleep(float("inf"))
-        return {"type": "http.disconnect"}  # pragma: no cover
+    async def receive() -> Message:  # pragma: no cover
+        # For spec_version >= 2.4, Starlette's `StreamingResponse.__call__`
+        # awaits `stream_response(send)` directly and never starts a
+        # `listen_for_disconnect` task, so this must never actually be
+        # called - assert instead of hanging forever if that's ever not
+        # true. Excluded from the coverage requirement: by design, nothing
+        # in this file calls it.
+        raise AssertionError(
+            "receive() should not be called on the ASGI spec >= 2.4 "
+            "send()-raises disconnect path"
+        )
 
     async def send(message: Message) -> None:
         nonlocal sent
@@ -254,3 +333,64 @@ async def test_sse_disconnect_returns_cleanly(backpressure: bool) -> None:
     caught = await _call_with_http_disconnect("/sse", backpressure=backpressure)
     assert caught is None, f"disconnect raised: {caught!r}"
     assert "dep exit" in events
+
+
+@pytest.mark.parametrize(
+    "path", ["/jsonl-checkpoint-finally", "/raw-checkpoint-finally"]
+)
+async def test_generator_finally_checkpoint_completes_before_dependency_exit_http_disconnect(
+    path: str,
+) -> None:
+    # The literal required behavior: a generator `finally` that itself
+    # awaits a checkpoint (not just starts) must complete *before* the
+    # dependency's teardown - i.e. the close must not be cancelled/cut off
+    # partway through. `session.closed` is only checked *after* the await
+    # inside `_cleanup_checkpoint`, so "gen cleanup post-checkpoint"
+    # (without "after dep exit") proves the await itself ran to completion
+    # first.
+    events.clear()
+    await _call_with_http_disconnect(path)
+    assert events == ["gen cleanup post-checkpoint", "dep exit"]
+
+
+@pytest.mark.parametrize(
+    "path", ["/jsonl-checkpoint-finally", "/raw-checkpoint-finally"]
+)
+async def test_generator_finally_checkpoint_completes_before_dependency_exit_send_raises(
+    path: str,
+) -> None:
+    events.clear()
+    await _call_with_send_raising(path)
+    assert events == ["gen cleanup post-checkpoint", "dep exit"]
+
+
+async def test_sse_generator_finally_checkpoint_completes_before_dependency_exit() -> (
+    None
+):
+    # SSE specifically: the producer task group's `_producer` drives the
+    # user generator directly (`sse_aiter` *is* `gen` for async
+    # generators), so there's a theoretical race between
+    # `tg.cancel_scope.cancel()` landing while `_producer` is genuinely
+    # inside `gen.__anext__()` (in which case cancellation reaches the
+    # generator directly, ahead of and independently of our `aclose()`
+    # callback) versus `gen` being parked at its own bare `yield` (the
+    # case this fix targets, where only our `aclose()` call ever resumes
+    # it). This endpoint has no internal checkpoint in its loop, so it is
+    # always in the latter state when idle. Either way the checkpoint
+    # inside `finally` must complete before the dependency's exit.
+    events.clear()
+    await _call_with_http_disconnect("/sse-checkpoint-finally")
+    assert events == ["gen cleanup post-checkpoint", "dep exit"]
+
+
+async def test_generator_finally_exception_propagates_and_dependency_still_exits() -> (
+    None
+):
+    events.clear()
+    caught = await _call_with_http_disconnect("/jsonl-finally-raises")
+    assert isinstance(caught, RuntimeError)
+    assert str(caught) == "cleanup itself failed"
+    # The generator's own cleanup work still happened (before it raised),
+    # and the dependency's exit still ran afterward - one misbehaving
+    # generator does not stop the rest of the exit stack from unwinding.
+    assert events == ["gen cleanup", "dep exit"]
