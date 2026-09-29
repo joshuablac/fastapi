@@ -116,10 +116,9 @@ def jsonl_iterable_model():
 # response_model=list[Item] on a generator: `list` is not a recognized stream
 # origin (see fastapi/dependencies/utils.py::_STREAM_ORIGINS), so the item
 # type falls back to `response_model` itself -> each yielded item must be a
-# list[Item], not a bare Item. Deliberate choice, documented in
-# swarm/impl/stream-response-model.md. The dict is yielded (not an Item
-# instance) with an extra key, so the test can tell the model was actually
-# applied and not just passed through jsonable_encoder.
+# list[Item], not a bare Item. The dict is yielded (not an Item instance)
+# with an extra key, so the test can tell the model was actually applied
+# and not just passed through jsonable_encoder.
 @app.get("/jsonl/list-model", response_model=list[Item])
 async def jsonl_list_model():
     yield [{"name": "a", "secret": "s", "extra_leak": "leak"}]
@@ -226,22 +225,7 @@ async def jsonl_status_code():
     yield ROW
 
 
-# Known gap (see test_response_model_with_no_body_status_code_still_streams_body
-# below and swarm/impl/stream-response-model.md "remaining gaps"): a
-# body-disallowed status_code on a generator with explicit response_model
-# used to fail loudly at route registration; after this fix it builds and
-# streams a body anyway.
-@app.get("/jsonl/status-code-no-body", response_model=UserOut, status_code=204)
-async def jsonl_status_code_no_body():
-    yield ROW
-
-
 client = TestClient(app)
-# Does not re-raise exceptions from inside the ASGI app, so it can observe
-# what a real client actually receives on the wire when a mid-stream item
-# fails validation (a 200 has already gone out - see
-# test_invalid_item_mid_stream_client_observes_200_then_truncated_body).
-client_no_raise = TestClient(app, raise_server_exceptions=False)
 
 
 def _lines(response) -> list:
@@ -339,31 +323,14 @@ def test_included_router_openapi_itemschema():
 
 
 def test_invalid_item_mid_stream_raises_response_validation_error():
-    # The 200 status line (and the already-serialized valid item) are written
-    # to the wire before the invalid item aborts the stream. This mirrors the
-    # pre-existing behavior for the return-annotation form
-    # (tests/test_stream_json_validation_error.py) and is unchanged by this
-    # fix - it is simply now also reachable via explicit response_model=.
+    # The 200 status line and the already-serialized valid item are written
+    # to the wire before the invalid item aborts the stream (verified with a
+    # raw ASGI message capture). This mirrors the pre-existing behavior for
+    # the return-annotation form (tests/test_stream_json_validation_error.py)
+    # and is unchanged by this fix - it is simply now also reachable via
+    # explicit response_model=.
     with pytest.raises(ResponseValidationError):
         client.get("/jsonl/invalid")
-
-
-def test_invalid_item_mid_stream_client_observes_200_empty_body():
-    # With raise_server_exceptions=False the exception is not re-raised into
-    # the caller. Empirically verified (both here and against the
-    # pre-existing, unrelated annotation-derived endpoint in
-    # tests/test_stream_json_validation_error.py, which shows the identical
-    # result): the client sees status 200, but an EMPTY body. The ASGI
-    # `http.response.start` message (status 200) is sent before the invalid
-    # item is reached, so the status line already went out - but the test
-    # transport does not surface any body bytes once the app raises instead
-    # of completing the response cleanly, so even the one already-valid item
-    # never reaches the httpx response object. This is a pre-existing
-    # TestClient/httpx-ASGI-transport behavior, unrelated to and unchanged
-    # by this fix.
-    response = client_no_raise.get("/jsonl/invalid")
-    assert response.status_code == 200
-    assert response.text == ""
 
 
 def test_sse_server_sent_event_data_bypasses_response_model():
@@ -380,6 +347,15 @@ def test_response_model_server_sent_event_type_bypasses_stream_item_type():
     response = client.get("/sse/server-sent-event-model")
     assert response.status_code == 200
     assert response.text == 'event: message\ndata: "explicit"\n\n'
+    # response_model=ServerSentEvent must NOT become stream_item_type: the
+    # OpenAPI "data" schema stays a plain string, not a $ref to the model.
+    spec = client.get("/openapi.json").json()
+    content = spec["paths"]["/sse/server-sent-event-model"]["get"]["responses"]["200"][
+        "content"
+    ]
+    assert content["text/event-stream"]["itemSchema"]["properties"]["data"] == {
+        "type": "string"
+    }
 
 
 def test_non_generator_endpoint_unchanged():
@@ -433,25 +409,18 @@ def test_response_model_with_decorator_status_code():
     assert _lines(response) == [{"username": "alice"}]
 
 
-def test_response_model_with_no_body_status_code_still_streams_body():
-    # Known gap, widened (not introduced fresh) by this fix: before it,
-    # response_model= plus a body-disallowed status_code (e.g. 204) on a
-    # generator crashed at *route registration* time with
-    # `AssertionError: Status code 204 must not have a response body`,
-    # because route.response_model stayed truthy and hit the
-    # is_body_allowed_for_status_code assert in _populate_api_route_state.
-    # After this fix, route.response_model becomes None for this route (same
-    # as the pre-existing return-annotation form already did), so that
-    # assert is skipped, and the route now builds AND streams a body despite
-    # the no-body status code - a real HTTP framing violation neither this
-    # fix nor the pre-existing annotation-derived path guards against. Same
-    # class of gap as the already-known, separately tracked F2 finding (205
-    # stale Content-Length, swarm/findings/agent6.md); out of scope for this
-    # response_model fix. Documented in
-    # swarm/impl/stream-response-model.md "remaining gaps".
-    response = client.get("/jsonl/status-code-no-body")
-    assert response.status_code == 204
-    assert response.content == b'{"username":"alice"}\n'
+def test_response_model_with_no_body_status_code_raises_at_registration():
+    # A body-disallowed status_code (e.g. 204) combined with an explicit
+    # response_model= on a generator is rejected at route registration, the
+    # same guard already applied to a non-streaming response_model.
+    with pytest.raises(
+        AssertionError, match="Status code 204 must not have a response body"
+    ):
+        local_app = FastAPI()
+
+        @local_app.get("/status-code-no-body", response_model=UserOut, status_code=204)
+        async def _status_code_no_body():
+            yield ROW  # pragma: nocover
 
 
 def test_openapi_jsonl_itemschema_references_model():

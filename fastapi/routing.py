@@ -1109,6 +1109,9 @@ def _populate_api_route_state(
         # itemSchema/contentSchema all apply. ServerSentEvent is excluded for
         # the same reason as above: it's a transport wrapper, not a data
         # model.
+        assert is_body_allowed_for_status_code(status_code), (
+            f"Status code {status_code} must not have a response body"
+        )
         stream_item = get_stream_item_type(response_model) or response_model
         if not lenient_issubclass(stream_item, ServerSentEvent):
             route.stream_item_type = stream_item
