@@ -520,6 +520,21 @@ def get_request_handler(
             if is_sse_stream:
                 # Generator endpoint: stream as Server-Sent Events
                 gen = dependant.call(**solved_result.values)
+                # Close the endpoint generator on the request-scoped exit
+                # stack, *before* it is wrapped by anything else below. Its
+                # `finally`/cleanup can then run before request-scoped
+                # (`yield`) dependencies are torn down, even on client
+                # disconnect: `gen` may be abandoned parked at its own
+                # `yield` (not inside one of its own `await`s), in which
+                # case nothing else ever resumes it to close it. Pushed
+                # before `_sse_producer_cm` is entered below, so on unwind
+                # (LIFO) the producer task group is cancelled and joined
+                # first, guaranteeing `gen` is no longer under active
+                # iteration when we close it.
+                if _is_async_gen_callable(dependant.call):
+                    async_exit_stack.push_async_callback(gen.aclose)
+                else:
+                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
 
                 def _serialize_sse_item(item: Any) -> bytes:
                     if isinstance(item, ServerSentEvent):
@@ -647,6 +662,13 @@ def get_request_handler(
             elif is_json_stream:
                 # Generator endpoint: stream as JSONL
                 gen = dependant.call(**solved_result.values)
+                # See the matching comment in the SSE branch above: close
+                # the generator on the request-scoped exit stack so its
+                # cleanup runs before dependency-with-yield teardown.
+                if _is_async_gen_callable(dependant.call):
+                    async_exit_stack.push_async_callback(gen.aclose)
+                else:
+                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
 
                 def _serialize_item(item: Any) -> bytes:
                     return _serialize_data(item) + b"\n"
@@ -685,7 +707,13 @@ def get_request_handler(
             ):
                 # Raw streaming with explicit response_class (e.g. StreamingResponse)
                 gen = dependant.call(**solved_result.values)
+                # See the matching comment in the SSE branch above: close
+                # the generator on the request-scoped exit stack so its
+                # cleanup runs before dependency-with-yield teardown. Do
+                # this before `gen` is reassigned to the checkpoint-wrapping
+                # generator below, so we close the user's own generator.
                 if _is_async_gen_callable(dependant.call):
+                    async_exit_stack.push_async_callback(gen.aclose)
 
                     async def _async_stream_raw(
                         async_gen: AsyncIterator[Any],
@@ -697,6 +725,8 @@ def get_request_handler(
                             await anyio.sleep(0)
 
                     gen = _async_stream_raw(gen)
+                else:
+                    async_exit_stack.push_async_callback(run_in_threadpool, gen.close)
                 response_args = _build_response_args(
                     status_code=status_code, solved_result=solved_result
                 )
