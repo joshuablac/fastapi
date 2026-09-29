@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.routing import (
     APIRoute,
     RouteContext,
+    _EffectiveRouteContext,
     _IncludedRouter,
     _iter_included_route_candidates,
     _restore_fastapi_scope_key,
@@ -1073,3 +1074,357 @@ async def test_apirouter_handle_fallback_without_include_context():
     assert messages[0]["type"] == "http.response.start"
     assert messages[0]["status"] == 200
     assert messages[1]["body"] == b"items"
+
+
+# --- A1-F1 facet A: get_route_handler() built once per effective route context ---
+#
+# Before the fix, APIRoute.handle() called request_response(self.get_route_handler())
+# on every request for a route reached through include_router(). A route_class
+# override of get_route_handler() (the documented extension point,
+# docs/en/docs/how-to/custom-request-and-route.md) therefore had its closure state
+# (rate limiters, counters, caches) reset on every request. The tests below pin the
+# fix: the handler is built once per (route, include context) and reused.
+
+
+def test_get_route_handler_closure_state_persists_across_included_requests():
+    class RateLimitedRoute(APIRoute):
+        def get_route_handler(self):
+            original = super().get_route_handler()
+            state = {"hits": 0}
+
+            async def handler(request: Request):
+                state["hits"] += 1
+                if state["hits"] > 2:
+                    return PlainTextResponse("rate limited", status_code=429)
+                return await original(request)
+
+            return handler
+
+    router = APIRouter(route_class=RateLimitedRoute)
+
+    @router.get("/limited")
+    def read_limited():
+        return {"ok": True}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+
+    codes = [client.get("/api/limited").status_code for _ in range(4)]
+
+    assert codes == [200, 200, 429, 429]
+
+
+def test_get_route_handler_build_count_stays_constant_direct_included_and_nested():
+    """get_route_handler() is called once at route construction (it builds
+    self.app, used by every plain/direct route) and, for a route reached
+    through include_router(), at most once more, lazily, the first time it
+    is actually dispatched to. Either way, the build count must not keep
+    growing as more requests come in -- which is what this test pins, by
+    comparing the count after the first request per route (a routes-through
+    baseline that already includes the unconditional __init__ build) against
+    the count after four more rounds of requests."""
+    builds = {"direct": 0, "included": 0, "nested": 0}
+
+    class TrackingRoute(APIRoute):
+        key = ""
+
+        def get_route_handler(self):
+            builds[self.key] += 1
+            return super().get_route_handler()
+
+    class DirectRoute(TrackingRoute):
+        key = "direct"
+
+    class IncludedRoute(TrackingRoute):
+        key = "included"
+
+    class NestedRoute(TrackingRoute):
+        key = "nested"
+
+    app = FastAPI()
+    app.router.add_api_route("/direct", lambda: "ok", route_class_override=DirectRoute)
+
+    included_router = APIRouter(route_class=IncludedRoute)
+    included_router.add_api_route("/included", lambda: "ok")
+    app.include_router(included_router, prefix="/api")
+
+    outer_router = APIRouter()
+    nested_router = APIRouter(route_class=NestedRoute)
+    nested_router.add_api_route("/nested", lambda: "ok")
+    outer_router.include_router(nested_router, prefix="/inner")
+    app.include_router(outer_router, prefix="/outer")
+
+    client = TestClient(app)
+
+    assert client.get("/direct").status_code == 200
+    assert client.get("/api/included").status_code == 200
+    assert client.get("/outer/inner/nested").status_code == 200
+    after_first_request = dict(builds)
+    # The included/nested routes each paid for exactly one lazy build (in
+    # addition to their unconditional __init__ build); the direct route
+    # only ever paid the __init__ build.
+    assert after_first_request["included"] >= 1
+    assert after_first_request["nested"] >= 1
+
+    for _ in range(4):
+        assert client.get("/direct").status_code == 200
+        assert client.get("/api/included").status_code == 200
+        assert client.get("/outer/inner/nested").status_code == 200
+
+    assert builds == after_first_request
+
+
+def test_get_route_handler_builds_once_per_repeated_router_inclusion():
+    """The same router included twice (different prefixes, different
+    include-level dependencies) must get two independent effective route
+    contexts, each with its own cached handler and its own include-level
+    state -- not a single handler shared across both inclusions."""
+    builds = {"n": 0}
+
+    class TrackingRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            return super().get_route_handler()
+
+    def mark_v1(request: Request) -> None:
+        request.state.marker = "v1"
+
+    def mark_v2(request: Request) -> None:
+        request.state.marker = "v2"
+
+    router = APIRouter(route_class=TrackingRoute)
+
+    @router.get("/items")
+    def read_items(request: Request):
+        return {"marker": request.state.marker}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/v1", dependencies=[Depends(mark_v1)])
+    app.include_router(router, prefix="/v2", dependencies=[Depends(mark_v2)])
+    client = TestClient(app)
+
+    builds_before_requests = builds["n"]
+    assert client.get("/v1/items").json() == {"marker": "v1"}
+    assert client.get("/v2/items").json() == {"marker": "v2"}
+    # Each inclusion's first dispatch pays for exactly one lazy build of its
+    # own effective context, regardless of how many builds construction
+    # itself already accounted for.
+    builds_after_first_round = builds["n"]
+    assert builds_after_first_round - builds_before_requests == 2
+
+    for _ in range(2):
+        assert client.get("/v1/items").json() == {"marker": "v1"}
+        assert client.get("/v2/items").json() == {"marker": "v2"}
+
+    assert builds["n"] == builds_after_first_round
+
+
+def test_get_route_handler_builds_once_for_route_added_after_inclusion():
+    builds = {"n": 0}
+
+    class TrackingRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            return super().get_route_handler()
+
+    router = APIRouter(route_class=TrackingRoute)
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+
+    @router.get("/later")
+    def read_later():
+        return {"later": True}
+
+    client = TestClient(app)
+    response = client.get("/api/later")
+    assert response.status_code == 200
+    assert response.json() == {"later": True}
+    builds_after_first_request = builds["n"]
+
+    for _ in range(3):
+        response = client.get("/api/later")
+        assert response.status_code == 200
+        assert response.json() == {"later": True}
+
+    assert builds["n"] == builds_after_first_request
+
+
+def test_dependency_overrides_take_effect_across_cached_included_route_requests():
+    def get_value():
+        return "original"  # pragma: no cover
+
+    router = APIRouter()
+
+    @router.get("/value")
+    def read_value(value: str = Depends(get_value)):
+        return {"value": value}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+
+    assert client.get("/api/value").json() == {"value": "original"}
+
+    app.dependency_overrides[get_value] = lambda: "overridden"
+    assert client.get("/api/value").json() == {"value": "overridden"}
+
+    del app.dependency_overrides[get_value]
+    assert client.get("/api/value").json() == {"value": "original"}
+
+
+def test_get_route_handler_state_is_independent_across_two_apps_sharing_a_router():
+    """The same router (and therefore the same APIRoute instances) included
+    into two different FastAPI apps must get independent caches: state built
+    for one app's inclusion must not leak into the other's."""
+    builds = {"n": 0}
+
+    class RateLimitedRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            original = super().get_route_handler()
+            state = {"hits": 0}
+
+            async def handler(request: Request):
+                state["hits"] += 1
+                if state["hits"] > 2:
+                    return PlainTextResponse("rate limited", status_code=429)
+                return await original(request)
+
+            return handler
+
+    router = APIRouter(route_class=RateLimitedRoute)
+
+    @router.get("/items")
+    def read_items():
+        return {"ok": True}
+
+    app_a = FastAPI()
+    app_a.include_router(router, prefix="/api")
+    app_b = FastAPI()
+    app_b.include_router(router, prefix="/api")
+
+    client_a = TestClient(app_a)
+    client_b = TestClient(app_b)
+
+    builds_before_requests = builds["n"]
+    codes_a = [client_a.get("/api/items").status_code for _ in range(3)]
+    codes_b = [client_b.get("/api/items").status_code for _ in range(3)]
+
+    assert codes_a == [200, 200, 429]
+    assert codes_b == [200, 200, 429]
+    # One lazy build per app's own inclusion, not shared between apps.
+    assert builds["n"] - builds_before_requests == 2
+
+
+def test_route_mutation_resets_effective_route_context_cache_for_whole_router():
+    """Adding a route to a router invalidates *all* cached effective route
+    contexts for that router together (the whole candidate list is rebuilt
+    by _IncludedRouter.effective_candidates()), including ones for
+    already-cached, unrelated routes. This is intentionally conservative:
+    it never serves a stale route, but a sibling route's get_route_handler()
+    closure state is rebuilt too, even though that route did not change."""
+    builds = {"n": 0}
+
+    class TrackingRoute(APIRoute):
+        def get_route_handler(self):
+            builds["n"] += 1
+            return super().get_route_handler()
+
+    router = APIRouter(route_class=TrackingRoute)
+
+    @router.get("/stable")
+    def read_stable():
+        return {"ok": True}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+
+    assert client.get("/api/stable").status_code == 200
+    builds_after_first_stable_request = builds["n"]
+    assert client.get("/api/stable").status_code == 200
+    # No mutation happened between these two requests: the cached handler
+    # must be reused, not rebuilt.
+    assert builds["n"] == builds_after_first_stable_request
+
+    @router.get("/added-later")
+    def read_added_later():  # pragma: no cover
+        return {"later": True}
+
+    # Adding /added-later paid for its own __init__ build, unrelated to
+    # /stable's cache; capture that separately so the assertion below only
+    # measures the effect of the mutation on /stable's own build count.
+    builds_after_adding_new_route = builds["n"]
+
+    assert client.get("/api/stable").status_code == 200
+    assert builds["n"] == builds_after_adding_new_route + 1
+
+
+def test_get_route_handler_builds_once_under_concurrent_first_requests():
+    builds = {"n": 0}
+    build_lock = threading.Lock()
+
+    class TrackingRoute(APIRoute):
+        def get_route_handler(self):
+            with build_lock:
+                builds["n"] += 1
+            return super().get_route_handler()
+
+    router = APIRouter(route_class=TrackingRoute)
+
+    @router.get("/items")
+    def read_items():
+        return {"ok": True}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    client = TestClient(app)
+    builds_before_requests = builds["n"]
+
+    thread_count = 8
+    barrier = threading.Barrier(thread_count)
+    results: list[int] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        barrier.wait()
+        response = client.get("/api/items")
+        with results_lock:
+            results.append(response.status_code)
+
+    threads = [threading.Thread(target=worker) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert results == [200] * thread_count
+    # Exactly one of the concurrent first requests won the build race.
+    assert builds["n"] - builds_before_requests == 1
+
+
+def test_get_route_handler_blocks_second_caller_until_first_build_completes():
+    router = APIRouter()
+
+    @router.get("/items")
+    def read_items():  # pragma: no cover
+        return {"ok": True}
+
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+    included_router = cast(_IncludedRouter, app.router.routes[-1])
+    effective_context = included_router.effective_candidates()[0]
+    assert isinstance(effective_context, _EffectiveRouteContext)
+
+    client = TestClient(app)
+    with effective_context._app_lock:
+        thread = threading.Thread(target=lambda: client.get("/api/items"))
+        thread.start()
+        thread.join(timeout=0.2)
+        assert thread.is_alive(), "second caller should block on the held lock"
+        assert effective_context._app is None
+
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert effective_context._app is not None

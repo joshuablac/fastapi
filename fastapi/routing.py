@@ -1271,11 +1271,21 @@ class APIRoute(routing.Route):
                 )
                 await response(scope, receive, send)
                 return
-            token = _effective_route_context_var.set(effective_context)
-            try:
-                app = request_response(self.get_route_handler())
-            finally:
-                _effective_route_context_var.reset(token)
+            app = effective_context._app
+            if app is None:
+                # Build the ASGI app once per effective route context (per
+                # route x include context), not once per request. Double-
+                # checked locking, same pattern as
+                # _IncludedRouter.effective_candidates().
+                with effective_context._app_lock:
+                    app = effective_context._app
+                    if app is None:
+                        token = _effective_route_context_var.set(effective_context)
+                        try:
+                            app = request_response(self.get_route_handler())
+                        finally:
+                            _effective_route_context_var.reset(token)
+                        effective_context._app = app
             await app(scope, receive, send)
             return
         await super().handle(scope, receive, send)
@@ -1421,6 +1431,18 @@ class _EffectiveRouteContext:
     body_field: ModelField | None = None
     is_sse_stream: bool = False
     is_json_stream: bool = False
+    # Built lazily, at most once, by APIRoute.handle() the first time this
+    # effective context is dispatched to. Caching it here (instead of
+    # rebuilding it on every request, as get_route_handler() otherwise
+    # would) keeps closure state that a route_class override keeps in
+    # get_route_handler() alive across requests. A fresh _EffectiveRouteContext
+    # is created by from_api_route() whenever the included-router tree
+    # changes (see _IncludedRouter.effective_candidates()), so this cache is
+    # invalidated for free: there is no old context left with a stale _app.
+    _app: ASGIApp | None = field(default=None, repr=False, compare=False)
+    _app_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     @classmethod
     def from_api_route(
