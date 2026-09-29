@@ -11,6 +11,7 @@ import threading
 import types
 import warnings
 from collections.abc import (
+    AsyncGenerator,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -568,7 +569,23 @@ def get_request_handler(
                 if _is_async_gen_callable(dependant.call):
                     sse_aiter: AsyncIterator[Any] = gen.__aiter__()
                 else:
+                    # `iterate_in_threadpool` returns a *separate* async
+                    # generator wrapping `gen` (unlike the async-gen case
+                    # above, where `sse_aiter` and `gen` are the same
+                    # object). It has no `finally` of its own connecting it
+                    # to `gen`, so closing `gen` (above) does not close
+                    # this wrapper - it needs its own close, or it's left
+                    # un-exhausted and can trigger its own
+                    # "was garbage collected before it had been exhausted"
+                    # `ResourceWarning` independent of `gen`'s cleanup.
                     sse_aiter = iterate_in_threadpool(gen)
+                    # `iterate_in_threadpool` is implemented as an async
+                    # generator (it really does have `.aclose()`), but its
+                    # own return type annotation is the narrower
+                    # `AsyncIterator[T]`.
+                    async_exit_stack.push_async_callback(
+                        cast(AsyncGenerator[Any, None], sse_aiter).aclose
+                    )
 
                 @asynccontextmanager
                 async def _sse_producer_cm() -> AsyncIterator[
